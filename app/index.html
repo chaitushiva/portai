@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LLM Comparison Tool</title>
+    <style>
+        textarea { width: 100%; height: 100px; }
+        table, th, td { border: 1px solid black; border-collapse: collapse; }
+    </style>
+</head>
+<body>
+    <h1>Compare Top LLMs</h1>
+    <form method="post">
+        <label>Prompt:</label><br>
+        <textarea name="prompt">{{ prompt or "" }}</textarea><br><br>
+
+        <label>Portkey API Key:</label><br>
+        <input type="text" name="portkey_api_key" required><br><br>
+
+        <label>Model List (format: model_id,provider):</label><br>
+        <textarea name="models">{{ models or "" }}</textarea><br><br>
+
+        <label>Virtual Keys (format: provider=key):</label><br>
+        <textarea name="virtual_keys">{{ virtual_keys or "" }}</textarea><br><br>
+
+        <input type="submit" value="Run">
+    </form>
+
+    {% if results %}
+        <h2>Results</h2>
+        <table>
+            <tr><th>Model</th><th>Output</th></tr>
+            {% for model, output in results.items() %}
+                <tr><td>{{ model }}</td><td>{{ output }}</td></tr>
+            {% endfor %}
+        </table>
+    {% endif %}
+</body>
+</html>
