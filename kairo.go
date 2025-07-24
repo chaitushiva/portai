@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -21,32 +20,34 @@ import (
 )
 
 func main() {
-	// Setup Kubernetes client
-	kubeconfig := flag.String("kubeconfig", "", "absolute path to the kubeconfig file (optional for in-cluster)")
-	flag.Parse()
-
-	var config *rest.Config
-	var err error
-
-	if *kubeconfig != "" {
-		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
-	} else {
-		config, err = rest.InClusterConfig()
-	}
+	// Load Kubernetes config
+	config, err := loadKubeConfig()
 	if err != nil {
-		log.Fatalf("Failed to create Kubernetes config: %v", err)
+		log.Fatalf("❌ Failed to create Kubernetes config: %v", err)
 	}
 
+	// Create clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
+		log.Fatalf("❌ Failed to create Kubernetes client: %v", err)
 	}
 
-	// Set up signal handler
+	// Handle SIGINT
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	watchPods(ctx, clientset)
+}
+
+func loadKubeConfig() (*rest.Config, error) {
+	kubeconfigEnv := os.Getenv("KUBECONFIG")
+	if kubeconfigEnv != "" {
+		log.Printf("📁 Using kubeconfig from KUBECONFIG=%s", kubeconfigEnv)
+		return clientcmd.BuildConfigFromFlags("", kubeconfigEnv)
+	}
+
+	log.Println("📦 Using in-cluster Kubernetes config")
+	return rest.InClusterConfig()
 }
 
 func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
@@ -55,22 +56,18 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
 		Watch:         true,
 	})
 	if err != nil {
-		log.Fatalf("Failed to start pod watcher: %v", err)
+		log.Fatalf("❌ Failed to start pod watcher: %v", err)
 	}
 	log.Println("📡 Watching for CrashLoopBackOff events...")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("⛔️ Shutting down watcher...")
+			log.Println("🛑 Shutting down watcher...")
 			return
 		case event := <-watcher.ResultChan():
 			pod, ok := event.Object.(*v1.Pod)
-			if !ok {
-				continue
-			}
-
-			if pod.Status.ContainerStatuses == nil {
+			if !ok || pod.Status.ContainerStatuses == nil {
 				continue
 			}
 
@@ -95,16 +92,16 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
 func sendToGateway(event map[string]interface{}) {
 	jsonBody, err := json.Marshal(event)
 	if err != nil {
-		log.Printf("Failed to marshal JSON: %v", err)
+		log.Printf("❌ Failed to marshal event JSON: %v", err)
 		return
 	}
 
 	resp, err := http.Post("http://localhost:5000/event", "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		log.Printf("Failed to send event to gateway: %v", err)
+		log.Printf("❌ Failed to send event to gateway: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Printf("📨 CrashLoopBackOff sent for pod %s", event["name"])
+	log.Printf("📨 CrashLoopBackOff sent for pod %s in namespace %s", event["name"], event["namespace"])
 }
