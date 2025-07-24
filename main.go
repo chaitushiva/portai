@@ -1,105 +1,93 @@
-// File: main.go
 package main
 
 import (
-    "bytes"
-    "context"
-    "encoding/json"
-    "fmt"
-    "log"
-    "net/http"
-    "os"
-    "path/filepath"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
 
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "k8s.io/apimachinery/pkg/watch"
-    "k8s.io/client-go/kubernetes"
-    "k8s.io/client-go/rest"
-    "k8s.io/client-go/tools/clientcmd"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
-type EventPayload struct {
-    PodName   string `json:"podName"`
-    NodeName  string `json:"nodeName"`
-    EventType string `json:"eventType"`
-    Reason    string `json:"reason"`
-    Message   string `json:"message"`
-    Timestamp string `json:"timestamp"`
+func getKubeClient() (*kubernetes.Clientset, error) {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	var config *rest.Config
+	var err error
+
+	if kubeconfig != "" {
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	} else {
+		config, err = rest.InClusterConfig()
+	}
+	if err != nil {
+		return nil, err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	return clientset, err
 }
 
-func getKubernetesClient() (*kubernetes.Clientset, error) {
-    var config *rest.Config
-    var err error
+func sendToPortkey(event corev1.Event) {
+	apiKey := os.Getenv("PORTKEY_API_KEY")
+	if apiKey == "" {
+		log.Println("PORTKEY_API_KEY not set")
+		return
+	}
 
-    if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-        config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-    } else {
-        config, err = rest.InClusterConfig()
-    }
-    if err != nil {
-        return nil, err
-    }
+	payload := map[string]interface{}{
+		"eventType":  event.Type,
+		"reason":     event.Reason,
+		"message":    event.Message,
+		"involved":   event.InvolvedObject.Kind + "/" + event.InvolvedObject.Name,
+		"namespace":  event.Namespace,
+		"timestamp":  event.FirstTimestamp,
+	}
 
-    return kubernetes.NewForConfig(config)
-}
+	jsonData, _ := json.Marshal(payload)
 
-func callPortkeyAI(event EventPayload) {
-    systemPrompt := "You are an SRE assistant. Given a Kubernetes event, return the root cause and suggested action."
-    content := fmt.Sprintf("Pod: %s\nNode: %s\nType: %s\nReason: %s\nMessage: %s\nTimestamp: %s",
-        event.PodName, event.NodeName, event.EventType, event.Reason, event.Message, event.Timestamp)
+	req, err := http.NewRequest("POST", "https://api.portkey.ai/v1/completions", 
+		bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Println("Error creating HTTP request:", err)
+		return
+	}
 
-    payload := map[string]interface{}{
-        "model": "gpt-4",
-        "messages": []map[string]string{
-            {"role": "system", "content": systemPrompt},
-            {"role": "user", "content": content},
-        },
-    }
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
 
-    jsonBody, _ := json.Marshal(payload)
-    req, _ := http.NewRequest("POST", "https://api.portkey.ai/v1/chat/completions", bytes.NewBuffer(jsonBody))
-    req.Header.Set("Authorization", "Bearer "+os.Getenv("PORTKEY_API_KEY"))
-    req.Header.Set("Content-Type", "application/json")
-
-    client := &http.Client{}
-    resp, err := client.Do(req)
-    if err != nil {
-        log.Printf("[ERROR] Failed to call Portkey AI: %v", err)
-        return
-    }
-    defer resp.Body.Close()
-
-    var result map[string]interface{}
-    json.NewDecoder(resp.Body).Decode(&result)
-    fmt.Printf("[AI RESPONSE] %+v\n", result)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Println("Error sending to Portkey:", err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("Portkey responded with status: %s\n", resp.Status)
 }
 
 func main() {
-    clientset, err := getKubernetesClient()
-    if err != nil {
-        log.Fatalf("[ERROR] Failed to create K8s client: %v", err)
-    }
+	clientset, err := getKubeClient()
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
 
-    watcher, err := clientset.CoreV1().Events("").Watch(context.TODO(), metav1.ListOptions{})
-    if err != nil {
-        log.Fatalf("[ERROR] Failed to set up event watcher: %v", err)
-    }
+	watch, err := clientset.CoreV1().Events("").Watch(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		log.Fatalf("Failed to watch events: %v", err)
+	}
 
-    log.Println("[INFO] Watching Kubernetes events...")
-    for event := range watcher.ResultChan() {
-        if evt, ok := event.Object.(*metav1.Event); ok {
-            if evt.Type == "Warning" || evt.Reason == "CrashLoopBackOff" {
-                payload := EventPayload{
-                    PodName:   evt.InvolvedObject.Name,
-                    NodeName:  evt.Source.Host,
-                    EventType: evt.Type,
-                    Reason:    evt.Reason,
-                    Message:   evt.Message,
-                    Timestamp: evt.LastTimestamp.Format(time.RFC3339),
-                }
-                go callPortkeyAI(payload)
-            }
-        }
-    }
+	log.Println("Watching Kubernetes events...")
+	for event := range watch.ResultChan() {
+		if ev, ok := event.Object.(*corev1.Event); ok {
+			log.Printf("Event: %s %s %s", ev.Type, ev.Reason, ev.Message)
+			sendToPortkey(*ev)
+		}
+	}
 }
