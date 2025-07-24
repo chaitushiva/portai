@@ -20,19 +20,16 @@ import (
 )
 
 func main() {
-	// Load Kubernetes config
 	config, err := loadKubeConfig()
 	if err != nil {
 		log.Fatalf("❌ Failed to create Kubernetes config: %v", err)
 	}
 
-	// Create clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("❌ Failed to create Kubernetes client: %v", err)
 	}
 
-	// Handle SIGINT
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -58,7 +55,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
 	if err != nil {
 		log.Fatalf("❌ Failed to start pod watcher: %v", err)
 	}
-	log.Println("📡 Watching for CrashLoopBackOff events...")
+	log.Println("📡 Watching for CrashLoopBackOff and Pending pods...")
 
 	for {
 		select {
@@ -71,6 +68,7 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
 				continue
 			}
 
+			// Check for CrashLoopBackOff
 			for _, cs := range pod.Status.ContainerStatuses {
 				if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
 					payload := map[string]interface{}{
@@ -81,9 +79,21 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset) {
 						"timestamp": time.Now().Format(time.RFC3339),
 						"node":      pod.Spec.NodeName,
 					}
-
 					go sendToGateway(payload)
 				}
+			}
+
+			// Check for Pending pod phase
+			if pod.Status.Phase == v1.PodPending {
+				payload := map[string]interface{}{
+					"name":      pod.Name,
+					"namespace": pod.Namespace,
+					"reason":    "Pending",
+					"message":   "Pod stuck in Pending phase",
+					"timestamp": time.Now().Format(time.RFC3339),
+					"node":      pod.Spec.NodeName,
+				}
+				go sendToGateway(payload)
 			}
 		}
 	}
@@ -103,5 +113,5 @@ func sendToGateway(event map[string]interface{}) {
 	}
 	defer resp.Body.Close()
 
-	log.Printf("📨 CrashLoopBackOff sent for pod %s in namespace %s", event["name"], event["namespace"])
+	log.Printf("📨 Sent event: %s pod %s in namespace %s", event["reason"], event["name"], event["namespace"])
 }
