@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,15 +28,12 @@ type PodFailureEvent struct {
 }
 
 func main() {
-	// Parse flags
 	apiURL := flag.String("api-url", "http://localhost:8000/analyze", "Kairo API URL")
-	kubeconfigPath := flag.String("kubeconfig", "", "absolute path to the kubeconfig file (optional)")
 	flag.Parse()
 
-	// Load kubeconfig (in-cluster or from file)
-	config, err := loadConfig(*kubeconfigPath)
+	config, err := loadConfig()
 	if err != nil {
-		log.Fatalf("Failed to load kubeconfig: %v", err)
+		log.Fatalf("Failed to load Kubernetes config: %v", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -53,18 +49,18 @@ func main() {
 	watchPods(ctx, clientset, *apiURL)
 }
 
-func loadConfig(kubeconfigPath string) (*rest.Config, error) {
-	if kubeconfigPath != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+func loadConfig() (*rest.Config, error) {
+	kubeconfigEnv := os.Getenv("KUBECONFIG")
+	if kubeconfigEnv != "" {
+		log.Printf("Using kubeconfig from KUBECONFIG: %s", kubeconfigEnv)
+		return clientcmd.BuildConfigFromFlags("", kubeconfigEnv)
 	}
+
+	log.Println("Using in-cluster kubeconfig")
 	return rest.InClusterConfig()
 }
 
 func watchPods(ctx context.Context, clientset *kubernetes.Clientset, apiURL string) {
-	// Cache to store last event time per pod (namespace/podName)
-	eventCache := make(map[string]time.Time)
-	cacheTTL := 10 * time.Minute
-
 	watcher, err := clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
 		FieldSelector: fields.Everything().String(),
 		Watch:         true,
@@ -84,8 +80,15 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, apiURL stri
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
 				log.Println("Watcher channel closed, restarting watcher...")
-				// restart logic omitted for brevity
-				return
+				// Simple restart logic
+				watcher, err = clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+					FieldSelector: fields.Everything().String(),
+					Watch:         true,
+				})
+				if err != nil {
+					log.Fatalf("Failed to restart pod watcher: %v", err)
+				}
+				continue
 			}
 			pod, ok := event.Object.(*v1.Pod)
 			if !ok || pod.Status.ContainerStatuses == nil {
@@ -94,26 +97,13 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, apiURL stri
 
 			for _, cs := range pod.Status.ContainerStatuses {
 				if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
-					key := pod.Namespace + "/" + pod.Name
-					now := time.Now()
-
-					// Check cache to avoid duplicates
-					if lastSent, found := eventCache[key]; found {
-						if now.Sub(lastSent) < cacheTTL {
-							log.Printf("Skipping duplicate event for %s (last sent %v ago)", key, now.Sub(lastSent))
-							continue
-						}
-					}
-
-					log.Printf("Pod %s in CrashLoopBackOff, sending event...", key)
-					eventCache[key] = now
-
+					log.Printf("Pod %s/%s in CrashLoopBackOff, sending event...", pod.Namespace, pod.Name)
 					event := PodFailureEvent{
 						PodName:   pod.Name,
 						Namespace: pod.Namespace,
 						Reason:    cs.State.Waiting.Reason,
 						Message:   cs.State.Waiting.Message,
-						Timestamp: now.UTC().Format(time.RFC3339),
+						Timestamp: time.Now().UTC().Format(time.RFC3339),
 					}
 					go sendEvent(apiURL, event)
 				}
@@ -121,7 +111,6 @@ func watchPods(ctx context.Context, clientset *kubernetes.Clientset, apiURL stri
 		}
 	}
 }
-
 
 func sendEvent(apiURL string, event PodFailureEvent) {
 	jsonBytes, err := json.Marshal(event)
