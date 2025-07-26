@@ -1,0 +1,135 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+type PodFailureEvent struct {
+	PodName   string `json:"pod_name"`
+	Namespace string `json:"namespace"`
+	Reason    string `json:"reason"`
+	Message   string `json:"message,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+func main() {
+	// Parse flags
+	apiURL := flag.String("api-url", "http://localhost:8000/analyze", "Kairo API URL")
+	kubeconfigPath := flag.String("kubeconfig", "", "absolute path to the kubeconfig file (optional)")
+	flag.Parse()
+
+	// Load kubeconfig (in-cluster or from file)
+	config, err := loadConfig(*kubeconfigPath)
+	if err != nil {
+		log.Fatalf("Failed to load kubeconfig: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes clientset: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	log.Println("Starting Kairo Agent pod watcher...")
+
+	watchPods(ctx, clientset, *apiURL)
+}
+
+func loadConfig(kubeconfigPath string) (*rest.Config, error) {
+	if kubeconfigPath != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	}
+	return rest.InClusterConfig()
+}
+
+func watchPods(ctx context.Context, clientset *kubernetes.Clientset, apiURL string) {
+	watcher, err := clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+		FieldSelector: fields.Everything().String(),
+		Watch:         true,
+	})
+	if err != nil {
+		log.Fatalf("Failed to create pod watcher: %v", err)
+	}
+	defer watcher.Stop()
+
+	log.Println("Watching pods for CrashLoopBackOff...")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Shutting down pod watcher...")
+			return
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				log.Println("Watcher channel closed, restarting watcher...")
+				// Simple restart logic, could be improved
+				watcher, err = clientset.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+					FieldSelector: fields.Everything().String(),
+					Watch:         true,
+				})
+				if err != nil {
+					log.Fatalf("Failed to restart pod watcher: %v", err)
+				}
+				continue
+			}
+			pod, ok := event.Object.(*v1.Pod)
+			if !ok || pod.Status.ContainerStatuses == nil {
+				continue
+			}
+
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+					log.Printf("Pod %s/%s in CrashLoopBackOff, sending event...", pod.Namespace, pod.Name)
+					event := PodFailureEvent{
+						PodName:   pod.Name,
+						Namespace: pod.Namespace,
+						Reason:    cs.State.Waiting.Reason,
+						Message:   cs.State.Waiting.Message,
+						Timestamp: time.Now().UTC().Format(time.RFC3339),
+					}
+					go sendEvent(apiURL, event)
+				}
+			}
+		}
+	}
+}
+
+func sendEvent(apiURL string, event PodFailureEvent) {
+	jsonBytes, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("Failed to marshal event JSON: %v", err)
+		return
+	}
+
+	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonBytes))
+	if err != nil {
+		log.Printf("Failed to POST event to API: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Received non-OK response from API: %v", resp.Status)
+		return
+	}
+
+	log.Printf("Successfully sent event for pod %s/%s", event.Namespace, event.PodName)
+}
