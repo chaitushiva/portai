@@ -1,3 +1,4 @@
+```
 gitops-repo/
 ├── base/                          # Common manifests
 │   ├── deployment.yaml
@@ -14,7 +15,7 @@ gitops-repo/
 │       ├── kustomization.yaml
 │       └── patch-deployment.yaml   # image: myapp:1.2.3 (until promoted)
 └── applicationset.yaml      
-
+```
 
 ```
 apiVersion: argoproj.io/v1alpha1
@@ -48,7 +49,7 @@ spec:
         namespace: myapp
 
 ```
-
+```
 gitops-repo/
 ├── orders/
 │   ├── base/
@@ -71,3 +72,4 @@ gitops-repo/
     │   ├── perf/
     │   └── prod/
     └── applicationset.yaml
+```
