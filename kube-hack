@@ -9,6 +9,22 @@ kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
 done
 
 #!/bin/bash
+output="pods_resources.csv"
+
+# Write CSV header
+echo "NAMESPACE,POD,CPU_USAGE,CPU_REQ,CPU_LIMIT,MEM_USAGE,MEM_REQ,MEM_LIMIT" > $output
+
+# Collect usage from top
+kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
+  # Extract requests & limits
+  req_lim=$(kubectl get pod $pod -n $ns -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{" "}{.resources.limits.cpu}{" "}{.resources.requests.memory}{" "}{.resources.limits.memory}{"\n"}{end}' | head -n1)
+
+  # Append as CSV row
+  echo "$ns,$pod,$cpu,$(echo $req_lim | awk '{print $1","$2","$3","$4}'),$mem" >> $output
+done
+
+
+#!/bin/bash
 echo -e "NAMESPACE\tPOD\tCPU_USAGE(m)\tCPU_REQ(m)\tCPU_LIMIT(m)\tCPU_REQ%\tCPU_LIMIT%\tMEM_USAGE(Mi)\tMEM_REQ(Mi)\tMEM_LIMIT(Mi)\tMEM_REQ%\tMEM_LIMIT%"
 
 kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
