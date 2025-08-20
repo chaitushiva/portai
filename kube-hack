@@ -14,6 +14,8 @@ output="pods_resources.csv"
 # Write CSV header
 echo "NAMESPACE,POD,CPU_USAGE,CPU_REQ,CPU_LIMIT,MEM_USAGE,MEM_REQ,MEM_LIMIT" > $output
 
+# loop only through dev-* namespaces
+for ns in $(kubectl get ns --no-headers -o custom-columns=":metadata.name" | grep '^dev-'); do
 # Collect usage from top
 kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
   # Extract requests & limits
@@ -21,6 +23,24 @@ kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
 
   # Append as CSV row
   echo "$ns,$pod,$cpu,$(echo $req_lim | awk '{print $1","$2","$3","$4}'),$mem" >> $output
+done
+
+
+#!/bin/bash
+output="pods_resources.csv"
+
+# Write CSV header
+echo "NAMESPACE,POD,CPU_USAGE,CPU_REQ,CPU_LIMIT,MEM_USAGE,MEM_REQ,MEM_LIMIT" > $output
+
+# Loop through namespaces matching test-plan-dev-*
+for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^test-plan-dev-'); do
+  kubectl top pod -n $ns --no-headers | while read pod cpu mem; do
+    # Extract requests & limits (first container of the pod)
+    req_lim=$(kubectl get pod $pod -n $ns -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{" "}{.resources.limits.cpu}{" "}{.resources.requests.memory}{" "}{.resources.limits.memory}{"\n"}{end}' | head -n1)
+
+    # Append row to CSV
+    echo "$ns,$pod,$cpu,$(echo $req_lim | awk '{print $1","$2","$3","$4}'),$mem" >> $output
+  done
 done
 
 
@@ -57,6 +77,24 @@ kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
 
   echo -e "$ns\t$pod\t${cpu_val}m\t${cpu_req_m}m\t${cpu_lim_m}m\t${cpu_req_pct}%\t${cpu_lim_pct}%\t${mem_val}Mi\t${mem_req_mi}Mi\t${mem_lim_mi}Mi\t${mem_req_pct}%\t${mem_lim_pct}%"
 done
+
+#!/bin/bash
+output="pods_resources.csv"
+
+# Write CSV header
+echo "NAMESPACE,POD,CPU_USAGE,CPU_REQ,CPU_LIMIT,MEM_USAGE,MEM_REQ,MEM_LIMIT" > $output
+
+# Loop through namespaces matching test-plan-dev-*
+for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep '^test-plan-dev-'); do
+  kubectl top pod -n $ns --no-headers | while read pod cpu mem; do
+    # Extract requests & limits (first container of the pod)
+    req_lim=$(kubectl get pod $pod -n $ns -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{" "}{.resources.limits.cpu}{" "}{.resources.requests.memory}{" "}{.resources.limits.memory}{"\n"}{end}' | head -n1)
+
+    # Append row to CSV
+    echo "$ns,$pod,$cpu,$(echo $req_lim | awk '{print $1","$2","$3","$4}'),$mem" >> $output
+  done
+done
+
 
 #!/bin/bash
 echo -e "NAMESPACE\tPOD\tCPU_USAGE(m)\tCPU_REQ(m)\tCPU_LIMIT(m)\tCPU_REQ%\tCPU_LIMIT%\tMEM_USAGE(Mi)\tMEM_REQ(Mi)\tMEM_LIMIT(Mi)\tMEM_REQ%\tMEM_LIMIT%"
