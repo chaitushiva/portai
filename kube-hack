@@ -1,0 +1,43 @@
+#!/bin/bash
+echo -e "NAMESPACE\tPOD\tCPU_USAGE\tCPU_REQ\tCPU_LIMIT\tMEM_USAGE\tMEM_REQ\tMEM_LIMIT"
+
+# Collect usage from top
+kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
+  # Extract requests & limits
+  req_lim=$(kubectl get pod $pod -n $ns -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{"\t"}{.resources.limits.cpu}{"\t"}{.resources.requests.memory}{"\t"}{.resources.limits.memory}{"\n"}{end}' | head -n1)
+  echo -e "$ns\t$pod\t$cpu\t$(echo $req_lim | awk '{print $1"\t"$2"\t"$3"\t"$4}')\t$mem"
+done
+
+#!/bin/bash
+echo -e "NAMESPACE\tPOD\tCPU_USAGE(m)\tCPU_REQ(m)\tCPU_LIMIT(m)\tCPU_REQ%\tCPU_LIMIT%\tMEM_USAGE(Mi)\tMEM_REQ(Mi)\tMEM_LIMIT(Mi)\tMEM_REQ%\tMEM_LIMIT%"
+
+kubectl top pod --all-namespaces --no-headers | while read ns pod cpu mem; do
+  # normalize CPU to milli (strip 'm')
+  cpu_val=$(echo $cpu | sed 's/m//')
+  mem_val=$(echo $mem | sed 's/Mi//')
+
+  # get requests/limits
+  req_lim=$(kubectl get pod $pod -n $ns -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{"\t"}{.resources.limits.cpu}{"\t"}{.resources.requests.memory}{"\t"}{.resources.limits.memory}{"\n"}{end}' | head -n1)
+
+  cpu_req=$(echo $req_lim | awk '{print $1}')
+  cpu_lim=$(echo $req_lim | awk '{print $2}')
+  mem_req=$(echo $req_lim | awk '{print $3}')
+  mem_lim=$(echo $req_lim | awk '{print $4}')
+
+  # convert cpu to milli if needed
+  cpu_req_m=$(echo $cpu_req | sed 's/m//' | sed 's/^$/0/')
+  cpu_lim_m=$(echo $cpu_lim | sed 's/m//' | sed 's/^$/0/')
+
+  # convert memory to Mi
+  mem_req_mi=$(echo $mem_req | sed 's/Mi//' | sed 's/^$/0/')
+  mem_lim_mi=$(echo $mem_lim | sed 's/Mi//' | sed 's/^$/0/')
+
+  # percentages
+  cpu_req_pct=0; cpu_lim_pct=0; mem_req_pct=0; mem_lim_pct=0
+  [[ $cpu_req_m -gt 0 ]] && cpu_req_pct=$(( 100 * cpu_val / cpu_req_m ))
+  [[ $cpu_lim_m -gt 0 ]] && cpu_lim_pct=$(( 100 * cpu_val / cpu_lim_m ))
+  [[ $mem_req_mi -gt 0 ]] && mem_req_pct=$(( 100 * mem_val / mem_req_mi ))
+  [[ $mem_lim_mi -gt 0 ]] && mem_lim_pct=$(( 100 * mem_val / mem_lim_mi ))
+
+  echo -e "$ns\t$pod\t${cpu_val}m\t${cpu_req_m}m\t${cpu_lim_m}m\t${cpu_req_pct}%\t${cpu_lim_pct}%\t${mem_val}Mi\t${mem_req_mi}Mi\t${mem_lim_mi}Mi\t${mem_req_pct}%\t${mem_lim_pct}%"
+done
