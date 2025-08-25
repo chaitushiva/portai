@@ -1,0 +1,43 @@
+/ Source logs from kubelet-managed container logs
+      loki.source.kubernetes "container_logs" {
+        targets = [
+          {
+            __path__ = "/var/log/containers/*.log"
+          }
+        ]
+        forward_to = [loki.process.kubernetes_logs.receiver]
+      }
+
+      // Enrich logs with Kubernetes metadata
+      loki.process.kubernetes "kubernetes_logs" {
+        forward_to = [loki.write.default.receiver]
+
+        labels = {
+          cluster   = env("CLUSTER_NAME")   // ✅ cluster as label
+          namespace = "kubernetes_namespace_name"
+          pod       = "kubernetes_pod_name"
+          container = "kubernetes_container_name"
+          node      = "kubernetes_node_name"
+        }
+
+        // Optional: relabel rules
+        relabel "drop_noise" {
+          source_labels = ["__path__"]
+          regex = ".*healthz.*"
+          action = "drop"
+        }
+
+        relabel "severity_from_log" {
+          source_labels = ["log"]
+          regex = ".*(ERROR|WARN).*"
+          replacement = "$1"
+          target_label = "severity"
+        }
+      }
+
+      // Write enriched logs to Loki
+      loki.write "default" {
+        endpoint {
+          url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+        }
+      }
