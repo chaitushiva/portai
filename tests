@@ -1,0 +1,63 @@
+# ------------------ Deployment -------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+      - name: demo
+        image: alpine
+        command: ["sh", "-c", "sleep 3600"]
+
+---
+# ------------------ PostSync Job 1 ----------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-file
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: create
+        image: alpine
+        command: ["sh", "-c", "touch /tmp/done.flag"]
+
+---
+# ------------------ PostSync Job 2 ----------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: validate-file
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: validate
+        image: alpine
+        command:
+          - sh
+          - -c
+          - |
+            if [ -f /tmp/done.flag ]; then
+              echo "PASS"; exit 0;
+            else
+              echo "FAIL"; exit 1;
+            fi
