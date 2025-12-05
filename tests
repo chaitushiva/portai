@@ -1,63 +1,113 @@
-# ------------------ Deployment -------------------
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: demo
-  template:
-    metadata:
-      labels:
-        app: demo
-    spec:
-      containers:
-      - name: demo
-        image: alpine
-        command: ["sh", "-c", "sleep 3600"]
+#!/bin/bash
 
----
-# ------------------ PostSync Job 1 ----------------
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: create-file
-  annotations:
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: HookSucceeded
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-      - name: create
-        image: alpine
-        command: ["sh", "-c", "touch /tmp/done.flag"]
+# --- CONFIGURATION ---
+# Define the target namespace prefix to filter on
+TARGET_NAMESPACE_PREFIX="teamA-dev"
 
----
-# ------------------ PostSync Job 2 ----------------
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: validate-file
-  annotations:
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: HookSucceeded
-spec:
-  template:
-    spec:
-      restartPolicy: Never
-      containers:
-      - name: validate
-        image: alpine
-        command:
-          - sh
-          - -c
-          - |
-            if [ -f /tmp/done.flag ]; then
-              echo "PASS"; exit 0;
-            else
-              echo "FAIL"; exit 1;
+# CPU: Utilization must be less than this percentage of the Request to be flagged.
+# (e.g., 0.1 means usage is < 10% of the request)
+CPU_OVER_PROVISION_THRESHOLD=0.1 
+
+# MEMORY: Utilization must be less than this percentage of the Request to be flagged.
+# (Memory is usually less bursty, so a higher threshold like 0.2 may be safer)
+MEMORY_OVER_PROVISION_THRESHOLD=0.2 
+
+# --- SCRIPT SETUP ---
+OUTPUT_FILE="over_provisioned_containers_${TARGET_NAMESPACE_PREFIX}_$(date +%Y%m%d_%H%M%S).csv"
+
+echo "🔎 Analyzing containers in namespaces starting with ${TARGET_NAMESPACE_PREFIX}..."
+echo "CPU Threshold: Utilization < ${CPU_OVER_PROVISION_THRESHOLD} * Request"
+echo "Memory Threshold: Utilization < ${MEMORY_OVER_PROVISION_THRESHOLD} * Request"
+echo "---"
+echo "NAMESPACE,POD_NAME,CONTAINER_NAME,CPU_REQUEST_m,CPU_UTIL_m,MEM_REQUEST_Mi,MEM_UTIL_Mi,CPU_RECOMMENDATION,MEMORY_RECOMMENDATION" | tee $OUTPUT_FILE
+echo "---"
+
+# 1. Get the list of all matching Namespaces
+NAMESPACES_TO_PROCESS=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' | tr -s ' ' '\n' | grep "^${TARGET_NAMESPACE_PREFIX}")
+
+if [ -z "$NAMESPACES_TO_PROCESS" ]; then
+    echo "⚠️ No namespaces found matching the prefix: ${TARGET_NAMESPACE_PREFIX}"
+    exit 0
+fi
+
+# 2. Iterate through each matching Namespace and list all Pods within it
+echo "$NAMESPACES_TO_PROCESS" | while read NS; do
+    
+    kubectl get pods -n "$NS" --output=custom-columns=POD_NAME:.metadata.name --no-headers 2>/dev/null | while read POD; do
+
+        # 3. Get the resource requests for the current Pod
+        REQUEST_DATA=$(kubectl get pod "$POD" -n "$NS" -o json | jq -r '.spec.containers[] | "\(.name) \(.resources.requests.cpu // "0") \(.resources.requests.memory // "0")"')
+
+        # 4. Get the current CPU/Memory usage for the current Pod
+        USAGE_DATA=$(kubectl top pod "$POD" -n "$NS" --containers 2>/dev/null)
+        
+        if [ -z "$USAGE_DATA" ]; then
+            continue 
+        fi
+
+        # 5. Process each container within the Pod
+        echo "$REQUEST_DATA" | while read CNAME CPU_REQ MEM_REQ; do
+            
+            # --- CPU Request Parsing ---
+            CPU_REQ_M=0
+            if [[ $CPU_REQ == *"m"* ]]; then
+                CPU_REQ_M=${CPU_REQ//m/}
+            elif [[ $CPU_REQ != "0" ]]; then
+                CPU_REQ_M=$(echo "$CPU_REQ * 1000" | bc)
             fi
+
+            # --- Memory Request Parsing (Mi) ---
+            MEM_REQ_Mi=0
+            if [[ $MEM_REQ == *"Mi"* ]]; then
+                MEM_REQ_Mi=${MEM_REQ//Mi/}
+            elif [[ $MEM_REQ == *"Gi"* ]]; then
+                MEM_REQ_Mi=$(echo "$MEM_REQ" | sed 's/Gi//' | awk '{print int($1 * 1024)}')
+            fi
+
+            # --- Utilization Extraction ---
+            UTIL_LINE=$(echo "$USAGE_DATA" | grep "$CNAME" | awk '{print $3, $4}')
+            CPU_UTIL=$(echo "$UTIL_LINE" | awk '{print $1}')
+            MEM_UTIL=$(echo "$UTIL_LINE" | awk '{print $2}')
+
+            if [ -z "$CPU_UTIL" ] || [ -z "$MEM_UTIL" ]; then
+                continue
+            fi
+            
+            # Parse CPU Utilization into millicores (m)
+            CPU_UTIL_M=${CPU_UTIL//m/}
+
+            # Parse Memory Utilization into MiB (assuming Mi is common 'top' output)
+            MEM_UTIL_Mi_RAW=$(echo "$MEM_UTIL" | sed 's/[^0-9.]*//g')
+            MEM_UTIL_Mi=$MEM_UTIL_Mi_RAW
+
+            # --- 6. Calculate and Check CPU Utilization ---
+            CPU_RECOMMENDATION="OK"
+            if [ "$CPU_REQ_M" -ne 0 ]; then
+                CPU_UTIL_RATIO=$(echo "scale=4; $CPU_UTIL_M / $CPU_REQ_M" | bc -l)
+                if (( $(echo "$CPU_UTIL_RATIO < $CPU_OVER_PROVISION_THRESHOLD" | bc -l) )); then
+                    # Recommendation: 2x current usage, rounded up
+                    REC_CPU_M=$(echo "scale=0; (($CPU_UTIL_M * 2) + 0.999) / 1" | bc) 
+                    CPU_RECOMMENDATION="Lower (Used: ${CPU_UTIL_M}m). Suggest approx ${REC_CPU_M}m"
+                fi
+            fi
+
+            # --- 7. Calculate and Check Memory Utilization ---
+            MEMORY_RECOMMENDATION="OK"
+            if [ "$MEM_REQ_Mi" -ne 0 ]; then
+                MEM_UTIL_RATIO=$(echo "scale=4; $MEM_UTIL_Mi / $MEM_REQ_Mi" | bc -l)
+                if (( $(echo "$MEM_UTIL_RATIO < $MEMORY_OVER_PROVISION_THRESHOLD" | bc -l) )); then
+                    # Recommendation: 1.5x current usage, rounded up
+                    REC_MEM_Mi=$(echo "scale=0; (($MEM_UTIL_Mi * 1.5) + 0.999) / 1" | bc) 
+                    MEMORY_RECOMMENDATION="Lower (Used: ${MEM_UTIL_Mi}Mi). Suggest approx ${REC_MEM_Mi}Mi"
+                fi
+            fi
+
+            # 8. Output the results
+            echo "$NS,$POD,$CNAME,$CPU_REQ_M,$CPU_UTIL_M,$MEM_REQ_Mi,$MEM_UTIL_Mi,$CPU_RECOMMENDATION,$MEMORY_RECOMMENDATION" | tee -a $OUTPUT_FILE
+
+        done
+    done
+done
+
+echo "---"
+echo "✅ Analysis complete for namespaces matching ${TARGET_NAMESPACE_PREFIX}. Check the summary file: $OUTPUT_FILE"
